@@ -16,7 +16,7 @@
 ----------------------------------------------------------------------
 
 require 'torch'
-require 'nn'
+require 'cunn'
 require 'nnx'
 require 'optim'
 require 'image'
@@ -45,6 +45,11 @@ local opt = lapp[[
 
 -- fix seed
 torch.manualSeed(1)
+
+-- set GPU
+cutorch.setDevice(1)
+print('using GPU:')
+print(cutorch.getDeviceProperties(cutorch.getDevice()))
 
 -- threads
 torch.setnumthreads(opt.threads)
@@ -120,6 +125,8 @@ else
    model = torch.load(opt.network)
 end
 
+model:cuda()
+
 -- retrieve parameters and gradients
 parameters,gradParameters = model:getParameters()
 
@@ -130,8 +137,8 @@ print(model)
 ----------------------------------------------------------------------
 -- loss function: negative log-likelihood
 --
-model:add(nn.LogSoftMax())
-criterion = nn.ClassNLLCriterion()
+model:add(nn.LogSoftMax():cuda())
+criterion = nn.ClassNLLCriterion():cuda()
 
 ----------------------------------------------------------------------
 -- get/create dataset
@@ -158,7 +165,7 @@ testData:normalizeGlobal(mean, std)
 --
 
 -- this matrix records the current confusion across classes
-confusion = optim.ConfusionMatrix(classes)
+confusion = optim.ConfusionMatrix(classes)  -- Keep confusion on the CPU
 
 -- log results to files
 trainLogger = optim.Logger(paths.concat(opt.save, 'train.log'))
@@ -175,10 +182,12 @@ function train(dataset)
    -- do one epoch
    print('<trainer> on training set:')
    print("<trainer> online epoch # " .. epoch .. ' [batchSize = ' .. opt.batchSize .. ']')
+   local inputs, targets, inputs_gpu, targets_gpu, outputs
    for t = 1,dataset:size(),opt.batchSize do
       -- create mini batch
-      local inputs = torch.Tensor(opt.batchSize,1,geometry[1],geometry[2])
-      local targets = torch.Tensor(opt.batchSize)
+      inputs = inputs or torch.Tensor(opt.batchSize,1,geometry[1],geometry[2])
+      targets = targets or torch.Tensor(opt.batchSize)
+      
       local k = 1
       for i = t,math.min(t+opt.batchSize-1,dataset:size()) do
          -- load new sample
@@ -191,6 +200,12 @@ function train(dataset)
          k = k + 1
       end
 
+      -- Copy to GPU in one go
+      inputs_gpu = inputs_gpu or inputs:cuda()
+      targets_gpu = targets_gpu or targets:cuda()
+      inputs_gpu:copy(inputs)
+      targets_gpu:copy(targets)
+
       -- create closure to evaluate f(X) and df/dX
       local feval = function(x)
          -- just in case:
@@ -198,6 +213,7 @@ function train(dataset)
 
          -- get new parameters
          if x ~= parameters then
+            print("WARNING: We're probably doing something wrong")
             parameters:copy(x)
          end
 
@@ -205,15 +221,19 @@ function train(dataset)
          gradParameters:zero()
 
          -- evaluate function for complete mini batch
-         local outputs = model:forward(inputs)
-         local f = criterion:forward(outputs, targets)
+         local outputs_gpu = model:forward(inputs_gpu)
+         outputs = outputs or outputs_gpu:float()
+         outputs:copy(outputs_gpu)
+
+         local f = criterion:forward(outputs_gpu, targets_gpu)
 
          -- estimate df/dW
-         local df_do = criterion:backward(outputs, targets)
-         model:backward(inputs, df_do)
+         local df_do_gpu = criterion:backward(outputs_gpu, targets_gpu)
+         model:backward(inputs_gpu, df_do_gpu)
 
          -- penalties (L1 and L2):
          if opt.coefL1 ~= 0 or opt.coefL2 ~= 0 then
+            -- TODO: This will fail if on the GPU
             -- locals:
             local norm,sign= torch.norm,torch.sign
 
@@ -298,13 +318,14 @@ function test(dataset)
 
    -- test over given dataset
    print('<trainer> on testing Set:')
+   local inputs, targets, inputs_gpu, targets_gpu, outputs
    for t = 1,dataset:size(),opt.batchSize do
       -- disp progress
       xlua.progress(t, dataset:size())
 
       -- create mini batch
-      local inputs = torch.Tensor(opt.batchSize,1,geometry[1],geometry[2])
-      local targets = torch.Tensor(opt.batchSize)
+      inputs = inputs or torch.Tensor(opt.batchSize,1,geometry[1],geometry[2])
+      targets = targets or torch.Tensor(opt.batchSize)
       local k = 1
       for i = t,math.min(t+opt.batchSize-1,dataset:size()) do
          -- load new sample
@@ -317,12 +338,20 @@ function test(dataset)
          k = k + 1
       end
 
+      -- Copy to GPU in one go
+      inputs_gpu = inputs_gpu or inputs:cuda()
+      targets_gpu = targets_gpu or targets:cuda()
+      inputs_gpu:copy(inputs)
+      targets_gpu:copy(targets)
+
       -- test samples
-      local preds = model:forward(inputs)
+      local outputs_gpu = model:forward(inputs_gpu)
+      outputs = outputs or outputs_gpu:float()
+      outputs:copy(outputs_gpu)
 
       -- confusion:
       for i = 1,opt.batchSize do
-         confusion:add(preds[i], targets[i])
+         confusion:add(outputs[i], targets[i])
       end
    end
 
